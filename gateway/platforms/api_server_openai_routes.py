@@ -476,18 +476,23 @@ class _ResponsesStream:
             self.result = result
             self.usage = agent_usage or self.usage
             agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
-            tail, appended = _post_stream_transform(result)
-            if tail and self.final_text_parts:
-                if appended:
-                    await self.emit_text_delta(tail)
-                else:
-                    self.transformed_final = agent_final
-            if agent_final and not self.final_text_parts:
-                await self.emit_text_delta(agent_final)
-            if agent_final and not self.final_response_text:
-                self.final_response_text = agent_final
-            if isinstance(result, dict) and result.get("error") and not self.final_response_text:
-                self.agent_error = self._api._redact_api_error_text(result["error"])
+            error = result.get("error") if isinstance(result, dict) else None
+            if isinstance(result, dict) and (result.get("failed") or (not result.get("completed", True) and error)):
+                # A failed final may be diagnostic text, even after earlier safe deltas.
+                self.agent_error = self._api._redact_api_error_text(error or agent_final or "agent run failed")
+            else:
+                tail, appended = _post_stream_transform(result)
+                if tail and self.final_text_parts:
+                    if appended:
+                        await self.emit_text_delta(tail)
+                    else:
+                        self.transformed_final = agent_final
+                if agent_final and not self.final_text_parts:
+                    await self.emit_text_delta(agent_final)
+                if agent_final and not self.final_response_text:
+                    self.final_response_text = agent_final
+                if error and not self.final_response_text:
+                    self.agent_error = self._api._redact_api_error_text(error)
         except Exception as e:
             logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
             self.agent_error = self._api._redact_api_error_text(e)
