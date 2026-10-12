@@ -3075,6 +3075,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_text_delta(agent_final)
                     if agent_final and not final_response_text:
                         final_response_text = agent_final
+                    # Preserve the legacy error-only path for agents that
+                    # return an empty final without failure/completion flags.
+                    if _r_err and not final_response_text:
+                        agent_error = _redact_api_error_text(_r_err)
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = _redact_api_error_text(e)
