@@ -151,6 +151,11 @@ class PublicSpeechStream(_ResponsesStream):
             result = {"failed": True, "completed": False}
         self.result = result
         failed = not isinstance(result, dict) or bool(result.get("failed") or result.get("error"))
+        # _ProviderAuthResolutionError is caught by _run_agent and returned as a
+        # guidance-only result: no model call and no failure flags. Its final text
+        # is diagnostic, not model speech.
+        if isinstance(result, dict) and result.get("api_calls") == 0 and not result.get("messages"):
+            failed = True
         incomplete = isinstance(result, dict) and bool(
             result.get("interrupted") or result.get("partial") or result.get("completed") is False)
         status = "failed" if failed else "incomplete" if incomplete else "completed"

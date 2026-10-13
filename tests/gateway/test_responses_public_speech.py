@@ -157,6 +157,27 @@ async def test_unsuccessful_result_never_promotes_diagnostic_to_speech(adapter, 
 
 
 @pytest.mark.asyncio
+async def test_provider_resolution_guidance_without_failure_flags_is_not_speech(adapter):
+    """_run_agent's provider-resolution catch returns api_calls=0 and a guidance final."""
+    guidance = "PRIVATE_PROVIDER_AUTH_GUIDANCE"
+
+    async def run(**kw):
+        return {"final_response": guidance, "messages": [], "api_calls": 0, "tools": []}, None
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run):
+            response = await client.post("/v1/responses", json={
+                "input": "question", "stream": True, "public_commentary": True})
+            wire = await response.read()
+        frames = _events(wire)
+        assert guidance not in wire.decode()
+        terminal = next(d["response"] for e, d in frames if e == "response.failed")
+        assert _messages(terminal) == []
+        stored = await client.get("/v1/responses/" + terminal["id"])
+        assert guidance not in await stored.text()
+
+
+@pytest.mark.asyncio
 async def test_failure_after_delivered_delta_keeps_only_delivered_public_text(adapter):
     async def run(**kw):
         kw["stream_delta_callback"]("Safe spoken prefix.")
