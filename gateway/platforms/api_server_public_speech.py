@@ -1,12 +1,12 @@
 """Request-owned public speech projection for opt-in Responses SSE consumers.
 
-Protocol callbacks stay private before enqueue. Raw text deltas are held until a completed
-interim message classifies them as commentary, or the agent completes and they become final
-speech. This delay is intentional: ordinary providers send a preamble through the delta
-callback before the agent knows it was an interim tool-round message.
+Protocol callbacks stay private before enqueue. Raw text deltas are never public in this
+mode: the producer classifies interim messages as commentary, while its successful result
+supplies the authoritative final answer. Final-token delivery is intentionally delayed.
 """
 import asyncio
 import logging
+import re
 import time
 import uuid
 from contextlib import suppress
@@ -74,31 +74,40 @@ def public_callbacks(queue):
     return on_commentary
 
 
+def valid_effective_session_id(value, adapter):
+    """Do not reflect an untrusted result identity or persist it for the next turn."""
+    from gateway.session import _is_path_unsafe
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    if re.search(r'[\r\n\x00]', value) or _is_path_unsafe(value):
+        return False
+    try:
+        return len(value.encode("utf-8")) <= adapter._MAX_SESSION_HEADER_LEN
+    except UnicodeError:
+        return False
+
+
 class PublicSpeechStream(_ResponsesStream):
     """The opt-in writer owns its own result classification and stored public envelope."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.pending_text: list[str] = []
         self.public_text: list[str] = []
         self._commentary: list[dict[str, Any]] = []
         self._terminal_message: dict[str, Any] | None = None
+        self._partial_commentary: dict[str, Any] | None = None
+        self._delivered_final = ""
 
     async def dispatch(self, item: Any) -> None:
         if isinstance(item, str):
-            self.pending_text.append(item)
+            return  # unclassified model/provider deltas never cross the public wire
         elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__commentary__":
             payload = item[1]
             if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
                 return
             text = payload["text"]
-            if payload.get("already_streamed"):
-                pending = "".join(self.pending_text)
-                # Exact match only: never drop unclassified trailing final tokens.
-                if pending.strip() == text.strip():
-                    self.pending_text.clear()
-                else:
-                    return
+            # The producer classifies interim speech, including preambles previously
+            # sent as raw internal deltas. Only its completed result defines final text.
             await self.emit_commentary(text)
 
     async def emit_commentary(self, text: str) -> None:
@@ -107,22 +116,39 @@ class PublicSpeechStream(_ResponsesStream):
                 "content": [{"type": "output_text", "text": text}]}
         idx = self.output_index
         self.output_index += 1
+        await self.write_event("response.output_item.added", {
+            "type": "response.output_item.added", "output_index": idx, "item": item})
+        # An added item has visible text but no done frame yet.
+        self._partial_commentary = {**item, "status": "in_progress"}
+        await self.write_event("response.output_item.done", {
+            "type": "response.output_item.done", "output_index": idx, "item": item})
         self._commentary.append(item)
-        for event in ("response.output_item.added", "response.output_item.done"):
-            await self.write_event(event, {"type": event, "output_index": idx, "item": item})
+        self._partial_commentary = None
 
     def _output(self):
-        return [*self._commentary, *([self._terminal_message] if self._terminal_message else [])]
+        return [*self._commentary, *([self._partial_commentary] if self._partial_commentary else []),
+                *([self._terminal_message] if self._terminal_message else [])]
 
     def _history(self):
         history = self._history_with_user()
-        if self.public_text:
-            history.append({"role": "assistant", "content": "".join(self.public_text)})
+        if self._delivered_final:
+            history.append({"role": "assistant", "content": self._delivered_final})
         return history
+
+    def _unsuccessful_envelope(self, status, *, interrupted=False):
+        items = self._output()
+        if self._delivered_final and self._terminal_message is None:
+            items.append({"id": self.message_item_id, "status": "incomplete",
+                          **_message_item(self._delivered_final)})
+        env = self.terminal_envelope(status, items, error="Agent did not complete.")
+        env["hermes"] = {"completed": False, "failed": status == "failed",
+                         "partial": bool(items), "interrupted": interrupted}
+        return env
 
     def persist_incomplete_if_needed(self):
         if self.store and not self.terminal_snapshot_persisted:
-            self.persist_snapshot(self.terminal_envelope("incomplete", self._output()), history=self._history())
+            self.persist_snapshot(self._unsuccessful_envelope("incomplete"), history=self._history(),
+                                  session_id=self.session_id)
 
     async def _close_public_final(self):
         text = "".join(self.public_text)
@@ -133,14 +159,16 @@ class PublicSpeechStream(_ResponsesStream):
             "type": "response.output_text.delta", "item_id": self.message_item_id,
             "output_index": self.message_output_index, "content_index": 0,
             "delta": text, "logprobs": []})
+        self._delivered_final = text
         await self.write_event("response.output_text.done", {
             "type": "response.output_text.done", "item_id": self.message_item_id,
             "output_index": self.message_output_index, "content_index": 0,
             "text": text, "logprobs": []})
-        self._terminal_message = {"id": self.message_item_id, "status": "completed", **_message_item(text)}
+        done_item = {"id": self.message_item_id, "status": "completed", **_message_item(text)}
         await self.write_event("response.output_item.done", {
             "type": "response.output_item.done", "output_index": self.message_output_index,
-            "item": self._terminal_message})
+            "item": done_item})
+        self._terminal_message = done_item
 
     async def finish(self, agent_task):
         try:
@@ -150,7 +178,7 @@ class PublicSpeechStream(_ResponsesStream):
             logger.exception("Agent failed during public speech Responses stream")
             result = {"failed": True, "completed": False}
         self.result = result
-        failed = not isinstance(result, dict) or bool(result.get("failed") or result.get("error"))
+        failed = not isinstance(result, dict) or not result or bool(result.get("failed") or result.get("error"))
         # _ProviderAuthResolutionError is caught by _run_agent and returned as a
         # guidance-only result: no model call and no failure flags. Its final text
         # is diagnostic, not model speech.
@@ -159,36 +187,42 @@ class PublicSpeechStream(_ResponsesStream):
         incomplete = isinstance(result, dict) and bool(
             result.get("interrupted") or result.get("partial") or result.get("completed") is False)
         status = "failed" if failed else "incomplete" if incomplete else "completed"
-        # A failed result's final_response can be a decorated provider diagnostic. Never
-        # project it as speech even when it differs from result.error.
         if status == "completed":
-            self.public_text = [*self.pending_text]
-            fallback = result.get("final_response")
-            # A result-only final is public only when the run has no diagnostic flags.
-            if not self.public_text and isinstance(fallback, str) and fallback:
-                self.public_text = [fallback]
-        else:
-            # Unclassified deltas may be provider diagnostics or failed attempts;
-            # nothing not already delivered is promoted after an unsuccessful turn.
-            self.public_text = []
-        await self._close_public_final()
-        env = self.terminal_envelope(status, self._output())
-        if status != "completed":
-            env["error"] = {"type": "server_error", "message": "Agent did not complete."}
-            env["hermes"] = {"completed": False, "failed": failed,
-                             "partial": bool(self._commentary or self.public_text),
-                             "interrupted": bool(isinstance(result, dict) and result.get("interrupted"))}
-            history = self._history()
-        else:
+            # Held deltas have never been delivered publicly. Only the successful
+            # agent's final is authoritative (including empty transforms).
+            final = result.get("final_response")
+            if result.get("_notification_presentation_suppressed") is True:
+                self.public_text = []
+            elif isinstance(final, str):
+                self.public_text = [final]
+            else:
+                self.public_text = []
             self.final_response_text = "".join(self.public_text)
+            # Preflight the private continuation before publishing the final item.
             history = self.adapter._build_response_conversation_history(
                 self.conversation_history, self.user_message, result, self.final_response_text,
                 tool_output_max_chars=self.adapter._history_tool_output_max_chars)
-        sid = result.get("session_id") if status == "completed" else None
-        self.persist_snapshot(env, history=history,
-                              session_id=sid if isinstance(sid, str) and sid else None)
-        self.terminal_snapshot_persisted = True
+            sid = result.get("session_id")
+            sid = sid if valid_effective_session_id(sid, self.adapter) else self.session_id
+            env = self.terminal_envelope(status, self._output())
+            env["hermes"] = {"session_id": sid}
+            # Store first: a failing store must never leave a completed final on the wire.
+            # Include the final in the snapshot without sending it prematurely.
+            final_item = ({"id": self.message_item_id, "status": "completed",
+                           **_message_item(self.final_response_text)} if self.final_response_text else None)
+            if final_item:
+                env["output"] = [*self._output(), final_item]
+            self.persist_snapshot(env, history=history, session_id=sid)
+            await self._close_public_final()
+        else:
+            # Failed raw deltas and result.final_response may be provider diagnostics.
+            self.public_text = []
+            env = self._unsuccessful_envelope(status, interrupted=bool(
+                isinstance(result, dict) and result.get("interrupted")))
+            self.persist_snapshot(env, history=self._history(), session_id=self.session_id)
+            self.terminal_snapshot_persisted = True
         await self.write_event("response." + status, {"type": "response." + status, "response": env})
+        self.terminal_snapshot_persisted = True
 
 
 async def write_public_speech(adapter, request, *, response_id, model, created_at, stream_q,
@@ -196,12 +230,14 @@ async def write_public_speech(adapter, request, *, response_id, model, created_a
                               instructions, conversation, store, session_id, gateway_session_key=None):
     """Opt-in writer, separate from the generic Responses writer and batch projection."""
     from gateway.platforms.api_server import _abandon_agent_task
-    response = await adapter._prepare_sse_response(request, session_id, gateway_session_key)
-    st = PublicSpeechStream(
-        adapter, response, response_id=response_id, model=model, created_at=created_at,
-        conversation_history=conversation_history, user_message=user_message,
-        instructions=instructions, conversation=conversation, store=store, session_id=session_id)
+    response = None
+    st = None
     try:
+        response = await adapter._prepare_sse_response(request, session_id, gateway_session_key)
+        st = PublicSpeechStream(
+            adapter, response, response_id=response_id, model=model, created_at=created_at,
+            conversation_history=conversation_history, user_message=user_message,
+            instructions=instructions, conversation=conversation, store=store, session_id=session_id)
         await st.emit_created()
         async for item in _iter_stream_items(stream_q, agent_task, response):
             if item is None:
@@ -209,17 +245,26 @@ async def write_public_speech(adapter, request, *, response_id, model, created_a
             await st.dispatch(item)
         await st.finish(agent_task)
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-        st.persist_incomplete_if_needed()
+        if st is not None:
+            with suppress(Exception):
+                st.persist_incomplete_if_needed()
         await _abandon_agent_task(agent_ref, agent_task, "SSE client disconnected")
     except asyncio.CancelledError:
-        st.persist_incomplete_if_needed()
+        if st is not None:
+            with suppress(Exception):
+                st.persist_incomplete_if_needed()
         await _abandon_agent_task(agent_ref, agent_task, "SSE task cancelled",
                                   reap_source="api_server_sse_cancelled", await_cancel=False)
         raise
     except Exception:
         logger.exception("Public speech Responses writer failed")
-        st.persist_incomplete_if_needed()
-        with suppress(Exception):
-            env = st.terminal_envelope("failed", st._output(), error="Agent did not complete.")
-            await st.write_event("response.failed", {"type": "response.failed", "response": env})
+        if st is not None:
+            with suppress(Exception):
+                env = st._unsuccessful_envelope("failed")
+                st.persist_snapshot(env, history=st._history(), session_id=st.session_id)
+                st.terminal_snapshot_persisted = True
+                await st.write_event("response.failed", {"type": "response.failed", "response": env})
+        await _abandon_agent_task(agent_ref, agent_task, "Public speech writer failed")
+        if response is None:
+            raise
     return response

@@ -5,6 +5,10 @@ The model is synthetic; callbacks, route, writer, and response store are product
 import asyncio
 import json
 from unittest.mock import patch
+from contextlib import ExitStack
+
+from tests.gateway.test_api_server_transform_llm_output import _app_with_fake_turn, TRANSFORMS, RAW
+from gateway.platforms import api_server_public_speech as public_speech
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -258,3 +262,254 @@ async def test_public_store_false_and_generic_stream_are_independent(adapter):
             assert any(e == "response.output_item.added" and d["item"]["type"] == "function_call"
                        for e, d in generic_frames)
             assert any(e == "response.output_text.delta" for e, _ in generic_frames)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", sorted(TRANSFORMS))
+async def test_public_final_uses_real_post_stream_transform(adapter, kind):
+    with ExitStack() as stack:
+        app = _app_with_fake_turn(adapter, TRANSFORMS[kind], stack)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/v1/responses", json={
+                "model": "m", "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await response.read())
+            terminal = next(d["response"] for e, d in frames if e == "response.completed")
+            expected = TRANSFORMS[kind](RAW)
+            assert _messages(terminal) == [(None, expected)]
+            assert [d["text"] for e, d in frames if e == "response.output_text.done"] == [expected]
+            stored = adapter._current_response_store().get(terminal["id"])
+            assert _messages(stored["response"]) == [(None, expected)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix,interim", [("same inter", "same interim"),
+                                            ("preface plus interim", "interim")])
+async def test_real_classifier_interim_never_promotes_held_prefix(adapter, prefix, interim):
+    async def run(**kw):
+        agent = _StreamAgent(kw)
+        agent._fire_stream_delta(prefix)
+        agent._emit_interim_assistant_message({"role": "assistant", "content": interim,
+                                               "tool_calls": [{"id": "private"}]})
+        return {"final_response": "final answer", "completed": True}, None
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run):
+            response = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await response.read())
+        terminal = next(d["response"] for e, d in frames if e == "response.completed")
+        assert _messages(terminal) == [("commentary", interim), (None, "final answer")]
+        assert [d["delta"] for e, d in frames if e == "response.output_text.delta"] == ["final answer"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sid,valid", [("rotated-child", True), ("../private", False),
+                                           ("x" * 257, False), ("é" * 129, False),
+                                           ("line\nbreak", False)])
+async def test_effective_session_id_only_valid_success_and_next_chain(adapter, sid, valid):
+    seen = []
+    async def run(**kw):
+        seen.append(kw["session_id"])
+        return {"final_response": "reply", "completed": True, "session_id": sid,
+                "_compressed": True, "messages": [{"role": "assistant", "content": "reply"}]}, None
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run):
+            first = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await first.read())
+            terminal = next(d["response"] for e, d in frames if e == "response.completed")
+            expected = sid if valid else first.headers["X-Hermes-Session-Id"]
+            assert terminal["hermes"]["session_id"] == expected
+            if not valid:
+                assert sid not in repr(terminal)
+            second = await client.post("/v1/responses", json={"input": "next",
+                "previous_response_id": terminal["id"], "stream": True, "public_commentary": True})
+            await second.read()
+            assert seen[1] == expected
+
+
+@pytest.mark.asyncio
+async def test_history_preflight_failure_stores_matching_failed_terminal_without_final(adapter):
+    async def run(**kw):
+        kw["interim_assistant_callback"]("Safe progress", already_streamed=False)
+        return {"final_response": "unpublished final", "completed": True}, None
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run), patch.object(
+            adapter, "_build_response_conversation_history", side_effect=RuntimeError("PRIVATE_HISTORY_ERROR")):
+            response = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await response.read())
+        terminal = next(d["response"] for e, d in frames if e == "response.failed")
+        stored = await (await client.get("/v1/responses/" + terminal["id"])).json()
+        assert stored == terminal
+        assert terminal["hermes"]["partial"] is True
+        assert _messages(terminal) == [("commentary", "Safe progress")]
+        assert "unpublished final" not in repr(frames)
+        assert "PRIVATE_HISTORY_ERROR" not in repr(terminal)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_event,expected", [
+    ("response.output_item.added", [("commentary", "Delivered")]),
+    ("response.output_item.done", [("commentary", "Delivered"),
+                                   ("commentary", "Partly delivered")]),
+])
+async def test_disconnect_snapshot_only_credits_written_commentary(adapter, failure_event, expected):
+    async def run(**kw):
+        kw["interim_assistant_callback"]("Delivered", already_streamed=False)
+        kw["interim_assistant_callback"]("Partly delivered", already_streamed=False)
+        return {"final_response": "not sent", "completed": True}, None
+
+    original = public_speech.PublicSpeechStream.write_event
+    async def disconnect(self, event, data):
+        if (event == failure_event and data.get("item", {}).get("phase") == "commentary"
+                and self.output_index == 2):
+            raise ConnectionResetError("transport")
+        return await original(self, event, data)
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run), patch.object(
+            public_speech.PublicSpeechStream, "write_event", disconnect):
+            response = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await response.read())
+        response_id = next(d["response"]["id"] for e, d in frames if e == "response.created")
+        stored = await (await client.get("/v1/responses/" + response_id)).json()
+        assert stored["status"] == "incomplete"
+        assert stored["hermes"]["partial"] is True
+        assert _messages(stored) == expected
+        if failure_event == "response.output_item.done":
+            assert stored["output"][-1]["status"] == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_no_authoritative_final_does_not_promote_unclassified_deltas(adapter):
+    async def run(**kw):
+        kw["stream_delta_callback"]("unclassified provider text")
+        return {"completed": True, "messages": []}, None
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run):
+            response = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await response.read())
+        terminal = next(d["response"] for e, d in frames if e == "response.completed")
+        assert not _messages(terminal)
+        assert "unclassified provider text" not in repr(frames)
+
+
+@pytest.mark.asyncio
+async def test_empty_authoritative_transform_never_falls_back_to_raw(adapter):
+    async def run(**kw):
+        kw["stream_delta_callback"]("raw to discard")
+        return {"final_response": "", "response_transformed": True, "completed": True}, None
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run):
+            response = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await response.read())
+        terminal = next(d["response"] for e, d in frames if e == "response.completed")
+        assert not _messages(terminal)
+        assert "raw to discard" not in repr(frames)
+
+
+@pytest.mark.asyncio
+async def test_muted_result_does_not_publish_raw_or_final(adapter):
+    async def run(**kw):
+        kw["stream_delta_callback"]("raw muted")
+        return {"final_response": "muted final", "completed": True,
+                "_notification_presentation_suppressed": True}, None
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run):
+            response = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await response.read())
+        terminal = next(d["response"] for e, d in frames if e == "response.completed")
+        assert not _messages(terminal)
+        assert "raw muted" not in repr(frames) and "muted final" not in repr(frames)
+
+
+@pytest.mark.asyncio
+async def test_empty_agent_result_fails_closed(adapter):
+    async def run(**kw):
+        return {}, None
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run):
+            response = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await response.read())
+        assert any(e == "response.failed" for e, _ in frames)
+        assert not any(e == "response.completed" for e, _ in frames)
+
+
+@pytest.mark.asyncio
+async def test_store_failure_before_final_reports_failed_without_publishing_final(adapter):
+    async def run(**kw):
+        kw["interim_assistant_callback"]("Visible progress", already_streamed=False)
+        return {"final_response": "must not publish", "completed": True}, None
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        store = adapter._current_response_store()
+        original = store.put
+        def reject_completed(response_id, snapshot):
+            if snapshot["response"]["status"] == "completed":
+                raise RuntimeError("PRIVATE_STORE_FAILURE")
+            return original(response_id, snapshot)
+        with patch.object(adapter, "_run_agent", side_effect=run), patch.object(
+            store, "put", side_effect=reject_completed):
+            response = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await response.read())
+        terminal = next(d["response"] for e, d in frames if e == "response.failed")
+        assert terminal == (await (await client.get("/v1/responses/" + terminal["id"])).json())
+        assert terminal["hermes"]["partial"] is True
+        assert "must not publish" not in repr(frames)
+        assert "PRIVATE_STORE_FAILURE" not in repr(terminal)
+
+
+@pytest.mark.asyncio
+async def test_final_delivery_disconnect_stores_only_delivered_delta(adapter):
+    async def run(**kw):
+        return {"final_response": "delivered text", "completed": True}, None
+    original = public_speech.PublicSpeechStream.write_event
+    async def disconnect(self, event, data):
+        if event == "response.output_text.done":
+            raise ConnectionResetError("transport")
+        return await original(self, event, data)
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run), patch.object(
+            public_speech.PublicSpeechStream, "write_event", disconnect):
+            response = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await response.read())
+        response_id = next(d["response"]["id"] for e, d in frames if e == "response.created")
+        stored = await (await client.get("/v1/responses/" + response_id)).json()
+        assert stored["status"] == "incomplete"
+        assert stored["hermes"]["partial"] is True
+        assert _messages(stored) == [(None, "delivered text")]
+        assert "session_id" not in stored.get("hermes", {})
+
+
+@pytest.mark.asyncio
+async def test_terminal_write_disconnect_does_not_leave_completed_snapshot(adapter):
+    async def run(**kw):
+        return {"final_response": "written final", "completed": True,
+                "session_id": "rotated-child"}, None
+    original = public_speech.PublicSpeechStream.write_event
+    async def disconnect(self, event, data):
+        if event == "response.completed":
+            raise ConnectionResetError("transport")
+        return await original(self, event, data)
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run), patch.object(
+            public_speech.PublicSpeechStream, "write_event", disconnect):
+            response = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await response.read())
+        response_id = next(d["response"]["id"] for e, d in frames if e == "response.created")
+        stored = adapter._current_response_store().get(response_id)
+        assert stored["response"]["status"] == "incomplete"
+        assert stored["response"]["hermes"]["partial"] is True
+        assert "session_id" not in stored["response"]["hermes"]
+        assert stored["session_id"] == response.headers["X-Hermes-Session-Id"]

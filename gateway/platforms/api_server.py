@@ -41,6 +41,8 @@ def _prefix_names_served_profile(profile: str) -> bool:
         return profile_matches_home(profile)
     except Exception:
         return False
+
+
 # Per-request /p/<profile>/ selection: set by the profile-prefix middleware, read by handlers.
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None)
@@ -134,9 +136,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
-from gateway.platforms import api_server_room_grants as _room_grants
-from gateway.platforms import api_server_runs as _api_runs
-from gateway.platforms import api_server_public_speech as _public_speech
+from gateway.platforms import api_server_room_grants as _room_grants, api_server_runs as _api_runs, api_server_public_speech as _public_speech
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
 from gateway.platforms.base import (
