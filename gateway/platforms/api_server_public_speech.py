@@ -6,7 +6,6 @@ supplies the authoritative final answer. Final-token delivery is intentionally d
 """
 import asyncio
 import logging
-import re
 import time
 import uuid
 from contextlib import suppress
@@ -79,7 +78,7 @@ def valid_effective_session_id(value, adapter):
     from gateway.session import _is_path_unsafe
     if not isinstance(value, str) or not value or value != value.strip():
         return False
-    if re.search(r'[\r\n\x00]', value) or _is_path_unsafe(value):
+    if any(ord(char) < 32 or ord(char) == 127 for char in value) or _is_path_unsafe(value):
         return False
     try:
         return len(value.encode("utf-8")) <= adapter._MAX_SESSION_HEADER_LEN
@@ -97,6 +96,7 @@ class PublicSpeechStream(_ResponsesStream):
         self._terminal_message: dict[str, Any] | None = None
         self._partial_commentary: dict[str, Any] | None = None
         self._delivered_final = ""
+        self.terminal_written = False
 
     async def dispatch(self, item: Any) -> None:
         if isinstance(item, str):
@@ -187,6 +187,8 @@ class PublicSpeechStream(_ResponsesStream):
         incomplete = isinstance(result, dict) and bool(
             result.get("interrupted") or result.get("partial") or result.get("completed") is False)
         status = "failed" if failed else "incomplete" if incomplete else "completed"
+        history = None
+        sid = self.session_id
         if status == "completed":
             # Held deltas have never been delivered publicly. Only the successful
             # agent's final is authoritative (including empty transforms).
@@ -204,16 +206,14 @@ class PublicSpeechStream(_ResponsesStream):
                 tool_output_max_chars=self.adapter._history_tool_output_max_chars)
             sid = result.get("session_id")
             sid = sid if valid_effective_session_id(sid, self.adapter) else self.session_id
+            # Exercise fallible storage before final delivery, but expose only an
+            # in-progress snapshot with the original session and no future speech.
+            # GET and previous_response_id may use that safe state while SSE is open.
+            self.persist_snapshot(self.envelope("in_progress") | {"output": self._output()},
+                                  history=self._history_with_user(), session_id=self.session_id)
+            await self._close_public_final()
             env = self.terminal_envelope(status, self._output())
             env["hermes"] = {"session_id": sid}
-            # Store first: a failing store must never leave a completed final on the wire.
-            # Include the final in the snapshot without sending it prematurely.
-            final_item = ({"id": self.message_item_id, "status": "completed",
-                           **_message_item(self.final_response_text)} if self.final_response_text else None)
-            if final_item:
-                env["output"] = [*self._output(), final_item]
-            self.persist_snapshot(env, history=history, session_id=sid)
-            await self._close_public_final()
         else:
             # Failed raw deltas and result.final_response may be provider diagnostics.
             self.public_text = []
@@ -222,6 +222,11 @@ class PublicSpeechStream(_ResponsesStream):
             self.persist_snapshot(env, history=self._history(), session_id=self.session_id)
             self.terminal_snapshot_persisted = True
         await self.write_event("response." + status, {"type": "response." + status, "response": env})
+        self.terminal_written = True
+        if status == "completed":
+            # The write completed: publish the prepared private continuation and
+            # rotated identity synchronously, with no await between wire and store.
+            self.persist_snapshot(env, history=history, session_id=sid)
         self.terminal_snapshot_persisted = True
 
 
@@ -245,12 +250,12 @@ async def write_public_speech(adapter, request, *, response_id, model, created_a
             await st.dispatch(item)
         await st.finish(agent_task)
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-        if st is not None:
+        if st is not None and not st.terminal_written:
             with suppress(Exception):
                 st.persist_incomplete_if_needed()
         await _abandon_agent_task(agent_ref, agent_task, "SSE client disconnected")
     except asyncio.CancelledError:
-        if st is not None:
+        if st is not None and not st.terminal_written:
             with suppress(Exception):
                 st.persist_incomplete_if_needed()
         await _abandon_agent_task(agent_ref, agent_task, "SSE task cancelled",
@@ -258,7 +263,11 @@ async def write_public_speech(adapter, request, *, response_id, model, created_a
         raise
     except Exception:
         logger.exception("Public speech Responses writer failed")
-        if st is not None:
+        if st is not None and st.terminal_written:
+            # A completed frame was already accepted by the transport; a late
+            # store failure cannot retract it. Never send a contradictory terminal.
+            logger.error("Public speech terminal was written but snapshot persistence failed")
+        elif st is not None:
             with suppress(Exception):
                 env = st._unsuccessful_envelope("failed")
                 st.persist_snapshot(env, history=st._history(), session_id=st.session_id)

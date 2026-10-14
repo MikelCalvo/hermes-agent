@@ -452,12 +452,15 @@ async def test_store_failure_before_final_reports_failed_without_publishing_fina
     async with TestClient(TestServer(_create_app(adapter))) as client:
         store = adapter._current_response_store()
         original = store.put
-        def reject_completed(response_id, snapshot):
-            if snapshot["response"]["status"] == "completed":
+        writes = 0
+        def reject_preflight(response_id, snapshot):
+            nonlocal writes
+            writes += 1
+            if writes == 2:  # created succeeded; safe preflight before any final write fails
                 raise RuntimeError("PRIVATE_STORE_FAILURE")
             return original(response_id, snapshot)
         with patch.object(adapter, "_run_agent", side_effect=run), patch.object(
-            store, "put", side_effect=reject_completed):
+            store, "put", side_effect=reject_preflight):
             response = await client.post("/v1/responses", json={
                 "input": "q", "stream": True, "public_commentary": True})
             frames = _events(await response.read())
@@ -489,6 +492,104 @@ async def test_final_delivery_disconnect_stores_only_delivered_delta(adapter):
         assert stored["hermes"]["partial"] is True
         assert _messages(stored) == [(None, "delivered text")]
         assert "session_id" not in stored.get("hermes", {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pause_at", ["response.output_text.delta", "response.completed"])
+async def test_pending_final_get_and_followup_cannot_publish_future_speech_or_rotation(adapter, pause_at):
+    reached, release = asyncio.Event(), asyncio.Event()
+    seen = []
+    original = public_speech.PublicSpeechStream.write_event
+
+    async def hold(self, event, data):
+        if event == pause_at and self.user_message == "q":
+            reached.set()
+            await release.wait()
+        return await original(self, event, data)
+
+    async def run(**kw):
+        seen.append(kw["session_id"])
+        return {"final_response": "future speech" if len(seen) == 1 else "followup",
+                "completed": True, "session_id": "rotated-child" if len(seen) == 1 else kw["session_id"],
+                "messages": [{"role": "assistant", "content": "future speech"}]}, None
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run), patch.object(
+            public_speech.PublicSpeechStream, "write_event", hold):
+            first = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            created = await first.content.readuntil(b"\n\n")
+            response_id = _events(created)[0][1]["response"]["id"]
+            try:
+                await asyncio.wait_for(reached.wait(), 3)
+                before = await (await client.get("/v1/responses/" + response_id)).json()
+                follow = await client.post("/v1/responses", json={
+                    "input": "next", "previous_response_id": response_id,
+                    "stream": True, "public_commentary": True})
+                await follow.read()
+                assert seen[1] == first.headers["X-Hermes-Session-Id"]
+                assert before["status"] == "in_progress"
+                assert "future speech" not in repr(before)
+                assert before.get("hermes", {}).get("session_id") != "rotated-child"
+            finally:
+                release.set()
+            terminal = next(d["response"] for e, d in _events(created + await first.read())
+                            if e == "response.completed")
+            assert (await (await client.get("/v1/responses/" + response_id)).json()) == terminal
+            assert terminal["hermes"]["session_id"] == "rotated-child"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sid", [f"abc{chr(n)}xyz" for n in (*range(32), 127)],
+                         ids=[f"U+{n:04X}" for n in (*range(32), 127)])
+async def test_c0_del_effective_id_falls_back_on_terminal_store_and_real_next_post(adapter, sid):
+    seen = []
+    async def run(**kw):
+        seen.append(kw["session_id"])
+        return {"final_response": "speech", "completed": True, "session_id": sid,
+                "messages": [{"role": "assistant", "content": "speech"}]}, None
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run):
+            first = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await first.read())
+            terminal = next(d["response"] for e, d in frames if e == "response.completed")
+            expected = first.headers["X-Hermes-Session-Id"]
+            assert terminal["hermes"]["session_id"] == expected
+            assert adapter._current_response_store().get(terminal["id"])["session_id"] == expected
+            follow = await client.post("/v1/responses", json={
+                "input": "next", "previous_response_id": terminal["id"],
+                "stream": True, "public_commentary": True})
+            assert follow.status == 200
+            assert any(e == "response.completed" for e, _ in _events(await follow.read()))
+            assert seen == [expected, expected]
+
+
+@pytest.mark.asyncio
+async def test_late_completed_store_failure_never_writes_second_terminal(adapter):
+    async def run(**kw):
+        return {"final_response": "delivered", "completed": True,
+                "session_id": "rotated-child"}, None
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        store = adapter._current_response_store()
+        original = store.put
+        def fail_commit(response_id, snapshot):
+            if snapshot["response"]["status"] == "completed":
+                raise RuntimeError("PRIVATE_LATE_STORE_FAILURE")
+            return original(response_id, snapshot)
+        with patch.object(adapter, "_run_agent", side_effect=run), patch.object(
+            store, "put", side_effect=fail_commit):
+            response = await client.post("/v1/responses", json={
+                "input": "q", "stream": True, "public_commentary": True})
+            frames = _events(await response.read())
+            terminal = next(d["response"] for e, d in frames if e == "response.completed")
+            assert [e for e, _ in frames if e in ("response.completed", "response.failed")] == ["response.completed"]
+            pending = await (await client.get("/v1/responses/" + terminal["id"])).json()
+            assert pending["status"] == "in_progress"
+            assert "delivered" not in repr(pending)
+            assert "rotated-child" not in repr(pending)
 
 
 @pytest.mark.asyncio
