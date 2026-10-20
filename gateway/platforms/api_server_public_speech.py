@@ -117,8 +117,10 @@ class PublicSpeechStream(_ResponsesStream):
         if self.terminal_replay:
             saved = self.response_store.get(self.response_id)
             if response_env['status'] != 'completed' or (
-                    saved and saved['response']['status'] == 'in_progress'):
-                return  # a joining request cannot overwrite the publisher's pending snapshot
+                    saved and saved['response']['status'] != 'incomplete'):
+                # Snapshot ownership does not depend on the derivative replay cache.
+                # Only a disconnected publisher's incomplete snapshot may be reconstructed.
+                return
         return super().persist_snapshot(response_env, history=history, session_id=session_id)
 
     async def dispatch(self, item: Any) -> None:
@@ -155,6 +157,12 @@ class PublicSpeechStream(_ResponsesStream):
                 *([self._terminal_message] if self._terminal_message else [])]
 
     def _history(self):
+        # Public delivery is not the private execution transcript. Retain observed
+        # tool calls/results on failure and writer recovery without exposing them.
+        if isinstance(self.result, dict) and isinstance(self.result.get('messages'), list) and self.result['messages']:
+            return self.adapter._build_response_conversation_history(
+                self.conversation_history, self.user_message, self.result, self._delivered_final,
+                tool_output_max_chars=self.adapter._history_tool_output_max_chars)
         history = self._history_with_user()
         if self._delivered_final:
             history.append({"role": "assistant", "content": self._delivered_final})
