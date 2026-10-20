@@ -91,6 +91,8 @@ def _responses_request_error(body):
         return _error_response("Missing 'input' field", 400)
     if body.get("public_commentary") is True and not _coerce_request_bool(body.get("stream"), default=False):
         return _error_response("'public_commentary' requires stream: true", 400)
+    if body.get('conversation') and body.get('previous_response_id'):
+        return _error_response("Cannot use both 'conversation' and 'previous_response_id'", 400)
     return None
 
 
@@ -1338,11 +1340,8 @@ class OpenAICompatRoutesMixin:
         if input_error is not None:
             return input_error
         instructions = body.get("instructions")
-        previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
         store = _coerce_request_bool(body.get("store"), default=True)
-        if conversation and previous_response_id:
-            return _error_response("Cannot use both 'conversation' and 'previous_response_id'", 400)
         stream = _coerce_request_bool(body.get("stream"), default=False)
         durable_key, idempotency_scope, idempotency_key, replayed = await self._responses_durable_replay(
             request, body, stream)
