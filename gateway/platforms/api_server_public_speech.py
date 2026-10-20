@@ -113,7 +113,17 @@ class PublicSpeechStream(_ResponsesStream):
         self.output_index += 1
         return index
 
+    def persist_snapshot(self, response_env, *, history=None, session_id=None):
+        if self.terminal_replay:
+            saved = self.response_store.get(self.response_id)
+            if response_env['status'] != 'completed' or (
+                    saved and saved['response']['status'] == 'in_progress'):
+                return  # a joining request cannot overwrite the publisher's pending snapshot
+        return super().persist_snapshot(response_env, history=history, session_id=session_id)
+
     async def dispatch(self, item: Any) -> None:
+        if self.terminal_replay:
+            return  # late observers cannot assign identities to a missing commentary prefix
         if isinstance(item, str):
             return  # unclassified model/provider deltas never cross the public wire
         elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__commentary__":
