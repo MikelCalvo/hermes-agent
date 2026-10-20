@@ -94,7 +94,9 @@ def _settled(record):
 def _responses_fingerprint_keys(body):
     """``truncation`` joins the fingerprint only when sent, so an exact retry of a request
     recorded before it was fingerprinted keeps matching its stored key."""
-    return _RESPONSES_FINGERPRINT_KEYS + (("truncation",) if body.get("truncation") is not None else ())
+    keys = _RESPONSES_FINGERPRINT_KEYS + (("truncation",) if body.get("truncation") is not None else ())
+    # Keep legacy generic fingerprints, but never replay a private projection as speech.
+    return keys + (("public_commentary",) if body.get("public_commentary") is True else ())
 
 
 def _response_identity(store, durable_key):
@@ -1363,7 +1365,10 @@ class OpenAICompatRoutesMixin:
                     request, body=body, run_kwargs=run_kwargs,
                     conversation_history=conversation_history, user_message=user_message,
                     instructions=instructions, conversation=conversation, store=store,
-                    session_id=session_id, gateway_session_key=gateway_session_key)
+                    session_id=session_id, gateway_session_key=gateway_session_key,
+                    run_agent=run_agent, response_id=response_id, created_at=created_at,
+                    response_model=response_model, durable_key=durable_key,
+                    terminal_replay=context.get('terminal_replay', False))
             _stream_q = ThreadSafeAsyncQueue()
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):

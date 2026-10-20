@@ -16,10 +16,10 @@ from gateway.platforms.api_server_openai_routes import _ResponsesStream, _iter_s
 logger = logging.getLogger("gateway.platforms.api_server")
 
 
-def spawn_public_speech(adapter, run_kwargs):
+def spawn_public_speech(adapter, run_kwargs, *, run_agent=None):
     queue = PublicSpeechQueue()
     agent_task, agent_ref = adapter._spawn_stream_agent(
-        queue, interim_assistant_callback=public_callbacks(queue),
+        queue, run_agent=run_agent, interim_assistant_callback=public_callbacks(queue),
         tool_start_callback=lambda *_: None, tool_complete_callback=lambda *_: None,
         tool_progress_callback=lambda *_args, **_kwargs: None, **run_kwargs)
     return queue, agent_task, agent_ref
@@ -27,15 +27,17 @@ def spawn_public_speech(adapter, run_kwargs):
 
 async def start_public_speech(adapter, request, *, body, run_kwargs, conversation_history,
                               user_message, instructions, conversation, store, session_id,
-                              gateway_session_key):
-    queue, task, agent_ref = spawn_public_speech(adapter, run_kwargs)
+                              gateway_session_key, run_agent, response_id, created_at,
+                              response_model, durable_key=None, terminal_replay=False):
+    queue, task, agent_ref = spawn_public_speech(adapter, run_kwargs, run_agent=run_agent)
     return await write_public_speech(
-        adapter, request, response_id=f"resp_{uuid.uuid4().hex[:28]}",
-        model=body.get("model", adapter._model_name), created_at=int(time.time()),
+        adapter, request, response_id=response_id,
+        model=response_model, created_at=created_at,
         stream_q=queue, agent_task=task, agent_ref=agent_ref,
         conversation_history=conversation_history, user_message=user_message,
         instructions=instructions, conversation=conversation, store=store,
-        session_id=session_id, gateway_session_key=gateway_session_key)
+        session_id=session_id, gateway_session_key=gateway_session_key,
+        durable_key=durable_key, terminal_replay=terminal_replay)
 
 
 class PublicSpeechQueue:
@@ -98,6 +100,21 @@ class PublicSpeechStream(_ResponsesStream):
         self._delivered_final = ""
         self.terminal_written = False
 
+    async def write_event(self, event_type, data):
+        # Public ordering is projection-local, never the private tool/reasoning ledger.
+        # Record only accepted writes; failed writes are not replay/delivery evidence.
+        import copy
+        data.setdefault('sequence_number', self.sequence_number)
+        self.sequence_number += 1
+        await self.response.write(self._api._sse_frame(data, event=event_type))
+        if self.durable_key:
+            self.recorded_events.append((event_type, copy.deepcopy(data)))
+
+    def _output_index(self, item_id):
+        index = self.output_index
+        self.output_index += 1
+        return index
+
     async def dispatch(self, item: Any) -> None:
         if isinstance(item, str):
             return  # unclassified model/provider deltas never cross the public wire
@@ -111,7 +128,7 @@ class PublicSpeechStream(_ResponsesStream):
             await self.emit_commentary(text)
 
     async def emit_commentary(self, text: str) -> None:
-        item = {"id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message",
+        item = {"id": self._item_id('message', commentary=True), "type": "message",
                 "role": "assistant", "status": "completed", "phase": "commentary",
                 "content": [{"type": "output_text", "text": text}]}
         idx = self.output_index
@@ -228,11 +245,20 @@ class PublicSpeechStream(_ResponsesStream):
             # rotated identity synchronously, with no await between wire and store.
             self.persist_snapshot(env, history=history, session_id=sid)
         self.terminal_snapshot_persisted = True
+        if self.durable_key and not self.terminal_replay:
+            # Keep only the public projection in the derivative retry cache. The
+            # authority's private execution receipt remains untouched.
+            headers = {key: value for key, value in self.response.headers.items()
+                       if key.startswith('X-Hermes-')}
+            self.response_store.put(self.durable_key[0], {
+                'fingerprint': self.durable_key[1], 'response': env, 'headers': headers,
+                'events': self.recorded_events})
 
 
 async def write_public_speech(adapter, request, *, response_id, model, created_at, stream_q,
                               agent_task, agent_ref, conversation_history, user_message,
-                              instructions, conversation, store, session_id, gateway_session_key=None):
+                              instructions, conversation, store, session_id, gateway_session_key=None,
+                              durable_key=None, terminal_replay=False):
     """Opt-in writer, separate from the generic Responses writer and batch projection."""
     from gateway.platforms.api_server import _abandon_agent_task
     response = None
@@ -242,7 +268,8 @@ async def write_public_speech(adapter, request, *, response_id, model, created_a
         st = PublicSpeechStream(
             adapter, response, response_id=response_id, model=model, created_at=created_at,
             conversation_history=conversation_history, user_message=user_message,
-            instructions=instructions, conversation=conversation, store=store, session_id=session_id)
+            instructions=instructions, conversation=conversation, store=store, session_id=session_id,
+            durable_key=durable_key, terminal_replay=terminal_replay)
         await st.emit_created()
         async for item in _iter_stream_items(stream_q, agent_task, response):
             if item is None:
