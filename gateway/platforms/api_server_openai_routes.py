@@ -85,6 +85,15 @@ _RESPONSES_FINGERPRINT_KEYS = (
 )
 
 
+def _responses_request_error(body):
+    from gateway.platforms.api_server import _coerce_request_bool, _error_response
+    if body.get("input") is None:
+        return _error_response("Missing 'input' field", 400)
+    if body.get("public_commentary") is True and not _coerce_request_bool(body.get("stream"), default=False):
+        return _error_response("'public_commentary' requires stream: true", 400)
+    return None
+
+
 def _settled(record):
     """A stored idempotency record that carries its answer. A claim written without one (an
     older release recorded the claim before the run) has an unknown outcome and never replays."""
@@ -1325,11 +1334,9 @@ class OpenAICompatRoutesMixin:
             body = await request.json()
         except Exception:
             return _invalid_request("Invalid JSON in request body")
-        raw_input = body.get("input")
-        if raw_input is None:
-            return _error_response("Missing 'input' field", 400)
-        if body.get("public_commentary") is True and not _coerce_request_bool(body.get("stream"), default=False):
-            return _error_response("'public_commentary' requires stream: true", 400)
+        input_error = _responses_request_error(body)
+        if input_error is not None:
+            return input_error
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
