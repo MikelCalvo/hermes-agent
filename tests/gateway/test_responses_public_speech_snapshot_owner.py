@@ -53,14 +53,13 @@ def producer(owner, seen, status, *, release=None, commentary=False):
                           {'id': PRIVATE, 'type': 'function', 'function': {
                               'name': 'external_tool', 'arguments': '{"key":"' + PRIVATE + '"}'}}]},
                       {'role': 'tool', 'tool_call_id': PRIVATE, 'content': PRIVATE}]}
-        if status == 'completed':
-            result['messages'].append({'role': 'assistant', 'content': 'Safe answer.'})
-        elif status == 'failed':
-            result.update(failed=True, error='PRIVATE_DIAGNOSTIC')
-        elif status == 'incomplete':
-            result['partial'] = True
-        elif status == 'interrupted':
-            result['interrupted'] = True
+        outcomes = {
+            'completed': {'messages': [*result['messages'], {'role': 'assistant', 'content': 'Safe answer.'}]},
+            'failed': {'failed': True, 'error': 'PRIVATE_DIAGNOSTIC'},
+            'incomplete': {'partial': True},
+            'interrupted': {'interrupted': True},
+        }
+        result.update(outcomes[status])
         execution_result.get()['result'] = result
         return result['final_response']
     owner.runner._handle_message = handle
